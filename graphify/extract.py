@@ -4985,6 +4985,7 @@ def extract_r(path: Path) -> dict:
                         break
         if t == "call" and body_node.children:
             callee_name = None
+            is_member_call = False
             for child in body_node.children:
                 # Direct call: foo(...)
                 if child.type == "identifier":
@@ -4995,16 +4996,19 @@ def extract_r(path: Path) -> dict:
                     identifiers = [c for c in child.children if c.type == "identifier"]
                     if len(identifiers) >= 2:
                         callee_name = _read_text(identifiers[-1], source)
+                    is_member_call = True
                     break
             if callee_name:
-                target_nid = _make_id(stem, callee_name)
-                add_node(target_nid, callee_name, body_node.start_point[0] + 1)
-                add_edge(func_nid, target_nid, "calls", body_node.start_point[0] + 1,
-                         confidence="EXTRACTED", context="call")
+                # Look up in file-local nodes first (same pattern as _extract_generic)
+                tgt_nid = label_to_nid.get(callee_name.lower())
+                if tgt_nid and tgt_nid != func_nid:
+                    add_edge(func_nid, tgt_nid, "calls", body_node.start_point[0] + 1,
+                             confidence="EXTRACTED", context="call")
+                # Always save to raw_calls for cross-file resolution
                 raw_calls.append({
                     "caller_nid": func_nid,
                     "callee": callee_name,
-                    "is_member_call": False,
+                    "is_member_call": is_member_call,
                     "source_file": str_path,
                     "source_location": f"L{body_node.start_point[0] + 1}",
                 })
@@ -5156,6 +5160,11 @@ def extract_r(path: Path) -> dict:
 
     # Pass 1: walk definitions
     walk(root, file_nid)
+
+    # Build label→nid map from defined nodes (for call resolution)
+    label_to_nid: dict[str, str] = {}
+    for n in nodes:
+        label_to_nid[n["label"].lower()] = n["id"]
 
     # Pass 2: walk function bodies for calls
     for func_nid, body_node in function_bodies:
