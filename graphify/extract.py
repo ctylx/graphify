@@ -4911,6 +4911,260 @@ def _extract_pascal_regex(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
 
 
+def extract_r(path: Path) -> dict:
+    """Extract functions, imports, S3 generics, and calls from a .r/.R file."""
+    try:
+        import tree_sitter_r as tsr
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree-sitter-r not installed"}
+
+    try:
+        language = Language(tsr.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, object]] = []
+    raw_calls: list[dict] = []
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid,
+                "label": label,
+                "file_type": "code",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        edge = {
+            "source": src,
+            "target": tgt,
+            "relation": relation,
+            "confidence": confidence,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": weight,
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def walk_calls(body_node, func_nid: str) -> None:
+        if body_node is None:
+            return
+        t = body_node.type
+        # Don't recurse into nested function definitions
+        if t == "function_definition":
+            return
+        # S3 class assignment inside function body: class(x) <- "classname"
+        if t == "binary_operator" and len(body_node.children) >= 3:
+            left = body_node.children[0]
+            right = body_node.children[-1]
+            if left.type == "call" and right.type == "string":
+                for c in left.children:
+                    if c.type == "identifier" and _read_text(c, source) == "class":
+                        class_name = _read_text(right, source).strip('"').strip("'")
+                        class_nid = _make_id(class_name)
+                        add_node(class_nid, class_name, body_node.start_point[0] + 1)
+                        add_edge(file_nid, class_nid, "uses", body_node.start_point[0] + 1,
+                                 confidence="INFERRED")
+                        break
+        if t == "call" and body_node.children:
+            callee_name = None
+            for child in body_node.children:
+                # Direct call: foo(...)
+                if child.type == "identifier":
+                    callee_name = _read_text(child, source)
+                    break
+                # Namespace call: pkg::foo(...)
+                elif child.type == "namespace_operator":
+                    identifiers = [c for c in child.children if c.type == "identifier"]
+                    if len(identifiers) >= 2:
+                        callee_name = _read_text(identifiers[-1], source)
+                    break
+            if callee_name:
+                target_nid = _make_id(stem, callee_name)
+                add_node(target_nid, callee_name, body_node.start_point[0] + 1)
+                add_edge(func_nid, target_nid, "calls", body_node.start_point[0] + 1,
+                         confidence="EXTRACTED", context="call")
+                raw_calls.append({
+                    "caller_nid": func_nid,
+                    "callee": callee_name,
+                    "is_member_call": False,
+                    "source_file": str_path,
+                    "source_location": f"L{body_node.start_point[0] + 1}",
+                })
+        for child in body_node.children:
+            walk_calls(child, func_nid)
+
+    def walk(node, scope_nid: str) -> None:
+        t = node.type
+
+        # Function definition via binary_operator: foo <- function(...) {...} or foo = function(...)
+        if t == "binary_operator":
+            children = node.children
+            if len(children) >= 3:
+                name_node = children[0]
+                op_node = children[1]
+                value_node = children[2]
+                # Function assignment: name <- function_definition or name = function_definition
+                if (name_node.type == "identifier"
+                        and op_node.type in ("<-", "=")
+                        and value_node.type == "function_definition"):
+                    func_name = _read_text(name_node, source)
+                    func_nid = _make_id(stem, func_name)
+                    line = node.start_point[0] + 1
+                    add_node(func_nid, func_name, line)
+                    add_edge(scope_nid, func_nid, "defines", line)
+                    function_bodies.append((func_nid, value_node))
+                    # Recurse into the rest of the tree, skip the function body here
+                    # (it will be walked in second pass)
+                    for i, child in enumerate(children):
+                        if i != 2:
+                            walk(child, scope_nid)
+                    return
+
+                # S3 class assignment: class(x) <- "classname"
+                if name_node.type == "call" and value_node.type == "string":
+                    for c in name_node.children:
+                        if c.type == "identifier" and _read_text(c, source) == "class":
+                            class_name = _read_text(value_node, source).strip('"').strip("'")
+                            class_nid = _make_id(class_name)
+                            line = node.start_point[0] + 1
+                            add_node(class_nid, class_name, line)
+                            add_edge(scope_nid, class_nid, "uses", line, confidence="INFERRED")
+                            break
+
+        # Call nodes — imports (library/require/source), S3 generics (UseMethod, inherits)
+        if t == "call":
+            func_name_node = None
+            args_node = None
+            for child in node.children:
+                if child.type == "identifier":
+                    func_name_node = child
+                elif child.type == "arguments":
+                    args_node = child
+
+            if func_name_node:
+                callee = _read_text(func_name_node, source)
+
+                # library() / require() — import detection
+                if callee in ("library", "require") and args_node:
+                    for arg in args_node.children:
+                        if arg.type == "argument":
+                            for sub in arg.children:
+                                if sub.type == "identifier":
+                                    pkg_name = _read_text(sub, source)
+                                    pkg_nid = _make_id(pkg_name)
+                                    line = node.start_point[0] + 1
+                                    add_node(pkg_nid, pkg_name, line)
+                                    add_edge(scope_nid, pkg_nid, "imports", line, context="import")
+                                    break
+                            break
+                    # Don't recurse into import calls
+                    for child in node.children:
+                        if child is not func_name_node and child is not args_node:
+                            walk(child, scope_nid)
+                    return
+
+                # source() — file import
+                if callee == "source" and args_node:
+                    for arg in args_node.children:
+                        if arg.type == "argument":
+                            for sub in arg.children:
+                                if sub.type == "string":
+                                    txt = _read_text(sub, source).strip('"').strip("'")
+                                    file_stem_name = txt.rsplit(".", 1)[0] if "." in txt else txt
+                                    src_nid = _make_id(file_stem_name)
+                                    line = node.start_point[0] + 1
+                                    add_node(src_nid, file_stem_name, line)
+                                    add_edge(scope_nid, src_nid, "imports", line, context="import")
+                                    break
+                            break
+                    for child in node.children:
+                        if child is not func_name_node and child is not args_node:
+                            walk(child, scope_nid)
+                    return
+
+                # UseMethod("name") — S3 generic dispatch
+                if callee == "UseMethod" and args_node:
+                    for arg in args_node.children:
+                        if arg.type == "argument":
+                            for sub in arg.children:
+                                if sub.type == "string":
+                                    method_name = _read_text(sub, source).strip('"').strip("'")
+                                    method_nid = _make_id(stem, method_name)
+                                    line = node.start_point[0] + 1
+                                    add_node(method_nid, method_name, line)
+                                    add_edge(scope_nid, method_nid, "calls", line,
+                                             confidence="INFERRED", context="call")
+                                    break
+                            break
+                    for child in node.children:
+                        if child is not func_name_node and child is not args_node:
+                            walk(child, scope_nid)
+                    return
+
+                # inherits(x, "classname") — S3 class usage
+                if callee == "inherits" and args_node:
+                    strings = []
+                    for arg in args_node.children:
+                        if arg.type == "argument":
+                            for sub in arg.children:
+                                if sub.type == "string":
+                                    strings.append(_read_text(sub, source).strip('"').strip("'"))
+                    if len(strings) >= 2:
+                        cls_name = strings[1]
+                        cls_nid = _make_id(cls_name)
+                        line = node.start_point[0] + 1
+                        add_node(cls_nid, cls_name, line)
+                        add_edge(scope_nid, cls_nid, "uses", line, confidence="INFERRED")
+
+        # Namespace operator (dplyr::mutate) at top level — treat as import
+        if t == "call":
+            for child in node.children:
+                if child.type == "namespace_operator":
+                    if len(child.children) >= 3:
+                        pkg_node = child.children[0]
+                        if pkg_node.type == "identifier":
+                            pkg_name = _read_text(pkg_node, source)
+                            pkg_nid = _make_id(pkg_name)
+                            line = node.start_point[0] + 1
+                            add_node(pkg_nid, pkg_name, line)
+                            add_edge(scope_nid, pkg_nid, "imports", line, context="import")
+                    break
+
+        for child in node.children:
+            walk(child, scope_nid)
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    # Pass 1: walk definitions
+    walk(root, file_nid)
+
+    # Pass 2: walk function bodies for calls
+    for func_nid, body_node in function_bodies:
+        for child in body_node.children:
+            walk_calls(child, func_nid)
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
+
+
 def extract_pascal(path: Path) -> dict:
     """Extract units, classes, procedures, uses-imports, and calls from Pascal/Delphi files.
 
@@ -5451,7 +5705,9 @@ _DISPATCH: dict[str, Any] = {
     ".cc": extract_cpp,
     ".cxx": extract_cpp,
     ".hpp": extract_cpp,
+    ".R": extract_r,
     ".rb": extract_ruby,
+    ".r": extract_r,
     ".cs": extract_csharp,
     ".kt": extract_kotlin,
     ".kts": extract_kotlin,

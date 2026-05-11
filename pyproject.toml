@@ -33,6 +33,7 @@ dependencies = [
     "tree-sitter-lua",
     "tree-sitter-zig",
     "tree-sitter-powershell",
+    "tree-sitter-r",
     "tree-sitter-elixir",
     "tree-sitter-objc",
     "tree-sitter-julia",

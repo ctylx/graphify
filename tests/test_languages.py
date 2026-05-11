@@ -6,7 +6,7 @@ from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
     extract_swift, extract_go, extract_julia, extract_js, extract_fortran,
-    extract_groovy,
+    extract_groovy, extract_r,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -964,3 +964,111 @@ def test_groovy_spock_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids
+
+
+# ── R ────────────────────────────────────────────────────────────────────────
+
+def test_r_no_error():
+    r = extract_r(FIXTURES / "sample.r")
+    assert "error" not in r
+
+
+def test_r_finds_functions():
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    assert any("analyze_data" in l for l in labels)
+    assert any("normalize" in l for l in labels)
+    assert any("compute_stats" in l for l in labels)
+    assert any("helper_func" in l for l in labels)
+
+
+def test_r_finds_function_assignment():
+    """Verify both <- and = assignment patterns are detected."""
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    # analyze_data uses <- assignment
+    assert any("analyze_data" in l for l in labels)
+    # normalize uses <- assignment
+    assert any("normalize" in l for l in labels)
+
+
+def test_r_finds_library_imports():
+    r = extract_r(FIXTURES / "sample.r")
+    node_ids = {n["id"] for n in r["nodes"]}
+    labels = _labels(r)
+    # library() and require() should create import edges
+    assert "imports" in _relations(r)
+    # Import targets should exist as nodes (Julia pattern)
+    import_edges = [e for e in r["edges"] if e["relation"] == "imports"]
+    for e in import_edges:
+        assert e["target"] in node_ids, f"Import target not a node: {e['target']}"
+    # Specific packages should be found
+    assert any("ggplot2" in l for l in labels)
+    assert any("dplyr" in l for l in labels)
+
+
+def test_r_finds_namespace_import():
+    """Verify :: operator creates import relationships."""
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    # dplyr:: used in fixture should create an import target node for 'dplyr'
+    assert any("dplyr" in l for l in labels)
+
+
+def test_r_finds_source_import():
+    """Verify source() creates import relationships."""
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    # source("helper.R") should create a node for helper
+    assert any("helper" in l.lower() for l in labels)
+
+
+def test_r_finds_s3_generic():
+    """Verify UseMethod() detection for S3 generics."""
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    # plot.myclass function contains UseMethod("plot")
+    assert any("plot" in l.lower() for l in labels)
+
+
+def test_r_finds_s3_class_assignment():
+    """Verify class()<- detection for S3 class registration."""
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    # class(result) <- "analyzed" should create a node for "analyzed"
+    assert any("analyzed" in l for l in labels)
+
+
+def test_r_emits_calls():
+    r = extract_r(FIXTURES / "sample.r")
+    call_edges = [e for e in r["edges"] if e["relation"] == "calls"]
+    assert len(call_edges) >= 1
+
+
+def test_r_no_dangling_edges():
+    r = extract_r(FIXTURES / "sample.r")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+        assert e["target"] in node_ids, f"Dangling target: {e}"
+
+
+def test_r_import_context():
+    r = extract_r(FIXTURES / "sample.r")
+    import_edges = _edges_with_relation(r, "imports", "imports_from")
+    assert import_edges
+    assert all(e.get("context") == "import" for e in import_edges)
+
+
+def test_r_call_context():
+    r = extract_r(FIXTURES / "sample.r")
+    call_edges = _edges_with_relation(r, "calls")
+    assert call_edges
+    assert all(e.get("context") == "call" for e in call_edges)
+
+
+def test_r_validates():
+    """Verify extraction output passes schema validation."""
+    from graphify.validate import assert_valid
+    r = extract_r(FIXTURES / "sample.r")
+    assert_valid(r)
