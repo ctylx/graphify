@@ -988,7 +988,7 @@ def test_r_finds_function_assignment():
     labels = _labels(r)
     # analyze_data uses <- assignment
     assert any("analyze_data" in l for l in labels)
-    # normalize uses <- assignment
+    # normalize uses = assignment
     assert any("normalize" in l for l in labels)
 
 

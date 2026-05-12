@@ -4967,11 +4967,29 @@ def extract_r(path: Path) -> dict:
         if body_node is None:
             return
         t = body_node.type
-        # Don't recurse into nested function definitions
-        if t == "function_definition":
-            return
-        # S3 class assignment inside function body: class(x) <- "classname"
+
+        # Named function definition inside a function body: inner <- function() {...}
         if t == "binary_operator" and len(body_node.children) >= 3:
+            name_node = body_node.children[0]
+            op_node = body_node.children[1]
+            value_node = body_node.children[2]
+            if (name_node.type == "identifier"
+                    and op_node.type in ("<-", "<<-", "=")
+                    and value_node.type == "function_definition"):
+                inner_name = _read_text(name_node, source)
+                inner_nid = _make_id(stem, inner_name)
+                line = body_node.start_point[0] + 1
+                add_node(inner_nid, inner_name, line)
+                add_edge(func_nid, inner_nid, "contains", line)
+                label_to_nid[inner_name.lower()] = inner_nid
+                # Walk the inner function body for calls
+                body = value_node.child_by_field_name("body")
+                if body:
+                    for child in body.children:
+                        walk_calls(child, inner_nid)
+                return
+
+            # S3 class assignment inside function body: class(x) <- "classname"
             left = body_node.children[0]
             right = body_node.children[-1]
             if left.type == "call" and right.type == "string":
@@ -4983,27 +5001,77 @@ def extract_r(path: Path) -> dict:
                         add_edge(file_nid, class_nid, "uses", body_node.start_point[0] + 1,
                                  confidence="INFERRED")
                         break
+
+        # Anonymous function: walk its body for calls in the enclosing scope
+        if t == "function_definition":
+            body = body_node.child_by_field_name("body")
+            if body:
+                for child in body.children:
+                    walk_calls(child, func_nid)
+            return
+
         if t == "call" and body_node.children:
             callee_name = None
             is_member_call = False
+            args_node = None
             for child in body_node.children:
                 # Direct call: foo(...)
                 if child.type == "identifier":
                     callee_name = _read_text(child, source)
-                    break
                 # Namespace call: pkg::foo(...)
                 elif child.type == "namespace_operator":
                     identifiers = [c for c in child.children if c.type == "identifier"]
                     if len(identifiers) >= 2:
                         callee_name = _read_text(identifiers[-1], source)
                     is_member_call = True
-                    break
+                elif child.type == "arguments":
+                    args_node = child
             if callee_name:
-                # Look up in file-local nodes first (same pattern as _extract_generic)
-                tgt_nid = label_to_nid.get(callee_name.lower())
-                if tgt_nid and tgt_nid != func_nid:
-                    add_edge(func_nid, tgt_nid, "calls", body_node.start_point[0] + 1,
-                             confidence="EXTRACTED", context="call")
+                # UseMethod("name") — S3 generic dispatch inside function body
+                if callee_name == "UseMethod" and args_node:
+                    for arg in args_node.children:
+                        if arg.type == "argument":
+                            for sub in arg.children:
+                                if sub.type == "string":
+                                    method_name = _read_text(sub, source).strip('"').strip("'")
+                                    method_nid = _make_id(stem, method_name)
+                                    line = body_node.start_point[0] + 1
+                                    add_node(method_nid, method_name, line)
+                                    add_edge(func_nid, method_nid, "calls", line,
+                                             confidence="INFERRED", context="call")
+                                    break
+                            break
+                    # Don't recurse into UseMethod call children or add to raw_calls
+                    for child in body_node.children:
+                        if child.type not in ("identifier", "arguments"):
+                            walk_calls(child, func_nid)
+                    return
+
+                # inherits(x, "classname") — S3 class usage inside function body
+                if callee_name == "inherits" and args_node:
+                    cls_name = None
+                    for arg in args_node.children:
+                        if arg.type == "argument" and arg.children:
+                            sub = arg.children[0]
+                            if sub.type == "identifier":
+                                cls_name = _read_text(sub, source)
+                            elif sub.type == "string":
+                                cls_name = _read_text(sub, source).strip('"').strip("'")
+                    if cls_name:
+                        cls_nid = _make_id(cls_name)
+                        line = body_node.start_point[0] + 1
+                        add_node(cls_nid, cls_name, line)
+                        add_edge(func_nid, cls_nid, "uses", line, confidence="INFERRED")
+                    # Fall through — inherits is also a call to the base function
+
+                # Look up in file-local nodes first (same pattern as _extract_generic).
+                # Skip local lookup for namespace calls (pkg::func) — they resolve to
+                # external packages, and a same-name local function would be a false positive.
+                if not is_member_call:
+                    tgt_nid = label_to_nid.get(callee_name.lower())
+                    if tgt_nid and tgt_nid != func_nid:
+                        add_edge(func_nid, tgt_nid, "calls", body_node.start_point[0] + 1,
+                                 confidence="EXTRACTED", context="call")
                 # Always save to raw_calls for cross-file resolution
                 raw_calls.append({
                     "caller_nid": func_nid,
@@ -5027,7 +5095,7 @@ def extract_r(path: Path) -> dict:
                 value_node = children[2]
                 # Function assignment: name <- function_definition or name = function_definition
                 if (name_node.type == "identifier"
-                        and op_node.type in ("<-", "=")
+                        and op_node.type in ("<-", "<<-", "=")
                         and value_node.type == "function_definition"):
                     func_name = _read_text(name_node, source)
                     func_nid = _make_id(stem, func_name)
@@ -5073,11 +5141,15 @@ def extract_r(path: Path) -> dict:
                             for sub in arg.children:
                                 if sub.type == "identifier":
                                     pkg_name = _read_text(sub, source)
-                                    pkg_nid = _make_id(pkg_name)
-                                    line = node.start_point[0] + 1
-                                    add_node(pkg_nid, pkg_name, line)
-                                    add_edge(scope_nid, pkg_nid, "imports", line, context="import")
-                                    break
+                                elif sub.type == "string":
+                                    pkg_name = _read_text(sub, source).strip('"').strip("'")
+                                else:
+                                    continue
+                                pkg_nid = _make_id(pkg_name)
+                                line = node.start_point[0] + 1
+                                add_node(pkg_nid, pkg_name, line)
+                                add_edge(scope_nid, pkg_nid, "imports", line, context="import")
+                                break
                             break
                     # Don't recurse into import calls
                     for child in node.children:
@@ -5097,6 +5169,14 @@ def extract_r(path: Path) -> dict:
                                     line = node.start_point[0] + 1
                                     add_node(src_nid, file_stem_name, line)
                                     add_edge(scope_nid, src_nid, "imports", line, context="import")
+                                    break
+                                elif sub.type == "identifier":
+                                    file_stem_name = _read_text(sub, source)
+                                    src_nid = _make_id(file_stem_name)
+                                    line = node.start_point[0] + 1
+                                    add_node(src_nid, file_stem_name, line)
+                                    add_edge(scope_nid, src_nid, "imports", line, context="import",
+                                             confidence="INFERRED")
                                     break
                             break
                     for child in node.children:
@@ -5125,14 +5205,17 @@ def extract_r(path: Path) -> dict:
 
                 # inherits(x, "classname") — S3 class usage
                 if callee == "inherits" and args_node:
-                    strings = []
+                    cls_name = None
+                    # Collect all argument values (identifiers and strings).
+                    # The class name is typically the last argument value.
                     for arg in args_node.children:
-                        if arg.type == "argument":
-                            for sub in arg.children:
-                                if sub.type == "string":
-                                    strings.append(_read_text(sub, source).strip('"').strip("'"))
-                    if len(strings) >= 2:
-                        cls_name = strings[1]
+                        if arg.type == "argument" and arg.children:
+                            sub = arg.children[0]
+                            if sub.type == "identifier":
+                                cls_name = _read_text(sub, source)
+                            elif sub.type == "string":
+                                cls_name = _read_text(sub, source).strip('"').strip("'")
+                    if cls_name:
                         cls_nid = _make_id(cls_name)
                         line = node.start_point[0] + 1
                         add_node(cls_nid, cls_name, line)
