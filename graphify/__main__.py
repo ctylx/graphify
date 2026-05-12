@@ -1177,6 +1177,8 @@ def main() -> None:
         print("    --out DIR               output dir (default: <path>); writes <DIR>/graphify-out/")
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
         print("    --no-cluster            skip clustering, write raw extraction only")
+        print("    --no-viz                skip graph.html generation (GRAPH_REPORT.md still written)")
+        print("    --label-communities     name each community via the selected LLM backend")
         print("    --global                also merge the resulting graph into the global graph")
         print("    --as <tag>              repo tag for --global (default: target directory name)")
         print("  global add <graph.json>  add/update a project graph in the global graph (~/.graphify/global-graph.json)")
@@ -2235,9 +2237,9 @@ def main() -> None:
         if len(sys.argv) < 3:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|glm|minimax|ollama] "
-                "[--model M] [--out DIR] [--google-workspace] [--no-cluster] "
-                "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--api-timeout S]",
+                "[--model M] [--out DIR] [--google-workspace] [--no-cluster] [--no-viz] "
+                "[--label-communities] [--max-workers N] [--token-budget N] "
+                "[--max-concurrency N] [--api-timeout S]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -2251,7 +2253,9 @@ def main() -> None:
         model: str | None = None
         out_dir: Path | None = None
         no_cluster = False
+        no_viz = False
         dedup_llm = False
+        label_communities_flag = False
         google_workspace = False
         global_merge = False
         global_repo_tag: str | None = None
@@ -2301,8 +2305,12 @@ def main() -> None:
                 out_dir = Path(a.split("=", 1)[1]); i += 1
             elif a == "--no-cluster":
                 no_cluster = True; i += 1
+            elif a == "--no-viz":
+                no_viz = True; i += 1
             elif a == "--dedup-llm":
                 dedup_llm = True; i += 1
+            elif a == "--label-communities":
+                label_communities_flag = True; i += 1
             elif a == "--google-workspace":
                 google_workspace = True; i += 1
             elif a == "--global":
@@ -2635,6 +2643,39 @@ def main() -> None:
         except Exception:
             surprises = []
 
+        labels: dict[int, str] = {cid: f"Community {cid}" for cid in communities}
+        labels_path = graphify_out / ".graphify_labels.json"
+        if label_communities_flag:
+            from graphify.analyze import label_communities as _label_communities
+            print(
+                f"[graphify extract] naming {len(communities)} communities via {backend}..."
+            )
+            labels = _label_communities(G, communities, backend=backend)
+            labels_path.write_text(
+                json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            named = sum(1 for v in labels.values() if not v.startswith("Community "))
+            print(
+                f"[graphify extract] wrote {labels_path} "
+                f"({named}/{len(labels)} LLM-named)"
+            )
+        elif labels_path.exists():
+            # Reuse existing labels (e.g. from a prior `--label-communities` run or
+            # the skill workflow) so re-running plain `graphify extract` doesn't
+            # downgrade community names back to "Community N" in the report/html.
+            try:
+                labels = {
+                    int(k): v
+                    for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()
+                    if int(k) in communities
+                }
+                # Fill in any new community ids not present in the old file.
+                for cid in communities:
+                    labels.setdefault(cid, f"Community {cid}")
+            except Exception:
+                labels = {cid: f"Community {cid}" for cid in communities}
+
         _to_json(G, communities, str(graph_json_path), force=True)
         if global_merge:
             from graphify.global_graph import global_add as _global_add
@@ -2663,6 +2704,51 @@ def main() -> None:
             _save_manifest(files_by_type, manifest_path=str(manifest_path))
         except Exception as exc:
             print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+
+        # GRAPH_REPORT.md — human-readable summary. Detection stats are
+        # available from the earlier `_detect` call so we pass them through
+        # instead of the cluster-only "stats not available" stub.
+        report_path = graphify_out / "GRAPH_REPORT.md"
+        try:
+            from graphify.report import generate as _report_generate
+            from graphify.analyze import suggest_questions as _suggest_questions
+            from graphify.export import _git_head as _git_head
+            questions = _suggest_questions(G, communities, labels)
+            report_md = _report_generate(
+                G, communities, cohesion, labels, gods, surprises,
+                detection, analysis["tokens"], str(target),
+                suggested_questions=questions,
+                built_at_commit=_git_head(),
+            )
+            report_path.write_text(report_md, encoding="utf-8")
+            print(f"[graphify extract] wrote {report_path}")
+        except Exception as exc:
+            print(
+                f"[graphify extract] warning: could not write GRAPH_REPORT.md: {exc}",
+                file=sys.stderr,
+            )
+
+        # graph.html — interactive viz. Gated by --no-viz; ValueError (oversized
+        # graph) is non-fatal and just skips the html, mirroring cluster-only.
+        html_path = graphify_out / "graph.html"
+        if no_viz:
+            if html_path.exists():
+                html_path.unlink()
+            print(f"[graphify extract] --no-viz: skipped graph.html")
+        else:
+            try:
+                from graphify.export import to_html as _to_html
+                _to_html(G, communities, str(html_path), community_labels=labels or None)
+                print(f"[graphify extract] wrote {html_path}")
+            except ValueError as viz_err:
+                if html_path.exists():
+                    html_path.unlink()
+                print(f"[graphify extract] skipped graph.html: {viz_err}")
+            except Exception as exc:
+                print(
+                    f"[graphify extract] warning: graph.html generation failed: {exc}",
+                    file=sys.stderr,
+                )
 
         cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
         print(

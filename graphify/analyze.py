@@ -491,6 +491,70 @@ def suggest_questions(
     return questions[:top_n]
 
 
+def label_communities(
+    G: nx.Graph,
+    communities: dict[int, list[str]],
+    *,
+    backend: str,
+    max_label_nodes: int = 20,
+    max_tokens: int = 24,
+) -> dict[int, str]:
+    """LLM-name each community using its most central node labels.
+
+    Returns {cid: name}. Falls back to "Community {cid}" on empty/error
+    so downstream consumers always get a usable label.
+    """
+    try:
+        from graphify.llm import _call_llm
+    except ImportError as exc:
+        print(
+            f"[graphify] --label-communities: cannot import _call_llm ({exc}); "
+            "falling back to default labels.",
+            flush=True,
+        )
+        return {cid: f"Community {cid}" for cid in communities}
+
+    labels: dict[int, str] = {}
+    for cid, nodes in communities.items():
+        sub = [n for n in nodes if n in G.nodes]
+        if not sub:
+            labels[cid] = f"Community {cid}"
+            continue
+        # Pick the most-connected nodes within the community as representatives.
+        ranked = sorted(sub, key=lambda n: G.degree(n), reverse=True)[:max_label_nodes]
+        node_lines = "\n".join(
+            f"- {G.nodes[n].get('label', n)}" for n in ranked
+        )
+        prompt = (
+            "These items form a single cluster in a knowledge graph. "
+            "Propose a concise 2-5 word name that describes the cluster's theme. "
+            "Reply with the name only — no quotes, no punctuation, no explanation.\n\n"
+            f"{node_lines}"
+        )
+        try:
+            raw = _call_llm(prompt, backend=backend, max_tokens=max_tokens)
+        except Exception as exc:
+            print(
+                f"[graphify] --label-communities: community {cid} failed ({exc}); "
+                "using default label.",
+                flush=True,
+            )
+            labels[cid] = f"Community {cid}"
+            continue
+        name = (raw or "").strip().splitlines()[0].strip() if raw and raw.strip() else ""
+        name = name.strip("\"'`*_ \t")
+        # Drop a leading "Name:" / "Cluster:" prefix some models emit.
+        for prefix in ("name:", "cluster:", "theme:", "label:"):
+            if name.lower().startswith(prefix):
+                name = name[len(prefix):].strip()
+        if not name:
+            labels[cid] = f"Community {cid}"
+        else:
+            # Cap length defensively in case the model ignores the word budget.
+            labels[cid] = name[:80]
+    return labels
+
+
 def graph_diff(G_old: nx.Graph, G_new: nx.Graph) -> dict:
     """Compare two graph snapshots and return what changed.
 
