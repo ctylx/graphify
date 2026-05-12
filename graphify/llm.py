@@ -1,5 +1,5 @@
 # Direct LLM backend for semantic extraction — supports Claude, Kimi K2.6,
-# Gemini, and OpenAI.
+# Gemini, OpenAI, Minimax, GLM (Zhipu AI), and local Ollama.
 # Used by `graphify extract . --backend gemini` and the benchmark scripts.
 # The default graphify pipeline uses Claude Code subagents via skill.md;
 # this module provides a direct API path for non-Claude-Code environments.
@@ -93,6 +93,36 @@ BACKENDS: dict[str, dict] = {
         "pricing": {"input": 3.0, "output": 15.0},  # USD per 1M tokens
         "temperature": 0,
         "max_tokens": 16384,
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-v4-flash",
+        "env_key": "DEEPSEEK_API_KEY",
+        "model_env_key": "GRAPHIFY_DEEPSEEK_MODEL",
+        "pricing": {"input": 0.27, "output": 1.10},
+        # NOTE: DeepSeek V4 requires non-zero temperature when thinking is
+        # disabled (see _call_openai_compat / _call_llm). Setting temperature=1.0
+        # avoids API errors while preserving extracted JSON determinism through
+        # `response_format={"type": "json_object"}`.
+        "temperature": 1.0,
+        "max_tokens": 16384,
+    },
+    "minimax": {
+        "base_url": "https://api.minimaxi.com/anthropic",
+        "default_model": "MiniMax-M2.1",
+        "env_key": "MINIMAX_API_KEY",
+        "model_env_key": "GRAPHIFY_MINIMAX_MODEL",
+        "pricing": {"input": 0.30, "output": 1.20},  # USD per 1M tokens (estimated)
+        "temperature": None,  # temperature hardcoded to 1.0 in _call_minimax_anthropic / _call_llm
+        "max_tokens": 16384,
+    },
+    "glm": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "default_model": "glm-5",
+        "env_key": "ZHIPU_API_KEY",
+        "model_env_key": "GRAPHIFY_GLM_MODEL",
+        "pricing": {"input": 1.00, "output": 3.00},  # USD per 1M tokens
+        "temperature": 0,
     },
 }
 
@@ -279,6 +309,14 @@ def _call_openai_compat(
     # Kimi-k2.6 is a reasoning model — disable thinking so content isn't empty
     if "moonshot" in base_url:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    # GLM-5 / GLM-5.1 are reasoning models — disable thinking so content isn't
+    # consumed by chain-of-thought blocks
+    if "z.ai" in base_url or "bigmodel" in base_url:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    # DeepSeek V4 enables thinking by default; disable for clean JSON output
+    if "deepseek" in base_url:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
     # Ollama defaults num_ctx to 2048 and silently truncates prompts larger
     # than that — the symptom is hollow 200 OK responses after the first few
     # chunks (#798). We derive num_ctx from the actual prompt size so we don't
@@ -420,6 +458,58 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192) -> dict
     return result
 
 
+def _call_minimax_anthropic(api_key: str, model: str, user_message: str, max_tokens: int = 8192) -> dict:
+    """Call Minimax via Anthropic-compatible API endpoint."""
+    try:
+        import anthropic
+    except ImportError as exc:
+        raise ImportError(
+            "Minimax Anthropic-compatible extraction requires the anthropic package. "
+            "Run: pip install anthropic"
+        ) from exc
+
+    timeout_raw = os.environ.get("GRAPHIFY_API_TIMEOUT", "").strip()
+    timeout_s: float = 600.0
+    if timeout_raw:
+        try:
+            v = float(timeout_raw)
+            if v > 0:
+                timeout_s = v
+        except ValueError:
+            pass
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        base_url="https://api.minimaxi.com/anthropic",
+        timeout=timeout_s,
+    )
+    resp = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=_EXTRACTION_SYSTEM,
+        messages=[{"role": "user", "content": user_message}],
+        temperature=1.0,
+    )
+    raw_content = None
+    if resp.content:
+        for block in resp.content:
+            if hasattr(block, "text"):
+                raw_content = block.text
+                break
+    result = _parse_llm_json(raw_content or "{}")
+    result["input_tokens"] = resp.usage.input_tokens if resp.usage else 0
+    result["output_tokens"] = resp.usage.output_tokens if resp.usage else 0
+    result["model"] = model
+    result["finish_reason"] = "length" if resp.stop_reason == "max_tokens" else "stop"
+    if _response_is_hollow(raw_content, result) and result["finish_reason"] != "length":
+        print(
+            "[graphify] minimax returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
+    return result
+
+
 def extract_files_direct(
     files: list[Path],
     backend: str = "kimi",
@@ -463,6 +553,8 @@ def extract_files_direct(
         return _call_claude(key, mdl, user_msg, max_tokens=max_out)
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out)
+    if backend == "minimax":
+        return _call_minimax_anthropic(key, mdl, user_msg, max_tokens=max_out)
     return _call_openai_compat(
         cfg["base_url"],
         key,
@@ -866,7 +958,27 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
         )
         return resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
 
-    # OpenAI-compatible (kimi, openai, gemini, ollama)
+    if backend == "minimax":
+        try:
+            import anthropic
+        except ImportError as exc:
+            raise ImportError("anthropic package required for minimax backend") from exc
+        client = anthropic.Anthropic(api_key=key, base_url="https://api.minimaxi.com/anthropic")
+        resp = client.messages.create(
+            model=mdl,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1.0,
+        )
+        raw_content = None
+        if resp.content:
+            for block in resp.content:
+                if hasattr(block, "text"):
+                    raw_content = block.text
+                    break
+        return raw_content or ""
+
+    # OpenAI-compatible (kimi, openai, gemini, ollama, deepseek, glm)
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -883,6 +995,10 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
     if cfg.get("reasoning_effort"):
         kwargs["reasoning_effort"] = cfg["reasoning_effort"]
     if "moonshot" in cfg["base_url"]:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    if "z.ai" in cfg["base_url"] or "bigmodel" in cfg["base_url"]:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    if "deepseek" in cfg["base_url"]:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content or ""
@@ -934,15 +1050,18 @@ def _validate_ollama_base_url(url: str) -> None:
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
-    Priority: gemini → kimi → claude → openai → bedrock → ollama (last, opt-in).
+    Priority: gemini → kimi → claude → openai → deepseek → glm → minimax → bedrock → ollama (last, opt-in).
 
     Ollama is intentionally checked LAST so a paid API key (Anthropic/OpenAI/etc.)
     is never silently shadowed by an incidental OLLAMA_BASE_URL in the environment
     — see security finding F-002/F-029. Setting OLLAMA_BASE_URL alongside a paid
     key now keeps you on the paid backend; remove the paid key (or pass
     --backend ollama explicitly) to route to the local model.
+
+    GLM and Minimax are checked after the major paid providers
+    but before Bedrock and Ollama.
     """
-    for backend in ("gemini", "kimi", "claude", "openai"):
+    for backend in ("gemini", "kimi", "claude", "openai", "deepseek", "glm", "minimax"):
         if _get_backend_api_key(backend):
             return backend
     if os.environ.get("AWS_PROFILE") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
