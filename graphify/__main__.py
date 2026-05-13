@@ -1148,6 +1148,9 @@ def main() -> None:
         print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")
+        print("    --inherit-labels-from-repos")
+        print("                            for a global graph, name each community via majority vote over")
+        print("                            per-project labels (uses ~/.graphify/global-manifest.json)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
@@ -1620,6 +1623,7 @@ def main() -> None:
         # Mirror the tree/export arg-parsing pattern: walk argv so flags and
         # the optional positional path can appear in any order (#724).
         no_viz = "--no-viz" in sys.argv
+        inherit_labels_from_repos = "--inherit-labels-from-repos" in sys.argv
         _min_cs_arg = next((a for a in sys.argv if a.startswith("--min-community-size=")), None)
         min_community_size = int(_min_cs_arg.split("=")[1]) if _min_cs_arg else 3
         args = sys.argv[2:]
@@ -1630,7 +1634,7 @@ def main() -> None:
             a = args[i_arg]
             if a == "--graph" and i_arg + 1 < len(args):
                 graph_override = Path(args[i_arg + 1]); i_arg += 2
-            elif a == "--no-viz" or a.startswith("--min-community-size="):
+            elif a == "--no-viz" or a.startswith("--min-community-size=") or a == "--inherit-labels-from-repos":
                 i_arg += 1
             elif a.startswith("--"):
                 i_arg += 1
@@ -1662,7 +1666,13 @@ def main() -> None:
         surprises = surprising_connections(G, communities)
         out = watch_path / "graphify-out"
         labels_path = out / ".graphify_labels.json"
-        if labels_path.exists():
+        if inherit_labels_from_repos:
+            from graphify.analyze import inherit_global_labels as _inherit_global_labels
+            print("[graphify cluster-only] inheriting community labels from per-project graphs (majority vote)...")
+            labels = _inherit_global_labels(G, communities)
+            named = sum(1 for v in labels.values() if not v.startswith("Community "))
+            print(f"[graphify cluster-only] inherited {named}/{len(labels)} community names")
+        elif labels_path.exists():
             try:
                 labels = {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
             except Exception:

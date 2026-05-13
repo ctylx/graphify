@@ -555,6 +555,93 @@ def label_communities(
     return labels
 
 
+def inherit_global_labels(
+    G: nx.Graph,
+    communities: dict[int, list[str]],
+) -> dict[int, str]:
+    """Name each *global* community by inheriting per-project labels via majority vote.
+
+    Every node in a global graph carries `repo` + `local_id` attrs (set by
+    `prefix_graph_for_global`). For each repo, we read its source graph.json
+    (path comes from ~/.graphify/global-manifest.json) to recover the original
+    {local_id: local_cid} mapping, and the sibling .graphify_labels.json for
+    {local_cid: name}. For each global community we tally those names across
+    its members and pick the most common one. Generic "Community N" entries
+    don't count as votes.
+
+    Falls back to "Community {cid}" when nothing usable can be inherited.
+    """
+    import json
+    from graphify.global_graph import _GLOBAL_MANIFEST
+
+    if not _GLOBAL_MANIFEST.exists():
+        return {cid: f"Community {cid}" for cid in communities}
+
+    try:
+        manifest = json.loads(_GLOBAL_MANIFEST.read_text(encoding="utf-8"))
+    except Exception:
+        return {cid: f"Community {cid}" for cid in communities}
+
+    # Per-repo lookup tables: {repo: {local_id: local_cid}} and {repo: {local_cid: name}}.
+    repo_node_cid: dict[str, dict[str, int]] = {}
+    repo_cid_label: dict[str, dict[int, str]] = {}
+    for repo, meta in manifest.get("repos", {}).items():
+        src = meta.get("source_path", "")
+        if not src:
+            continue
+        src_path = Path(src)
+        if not src_path.exists():
+            continue
+        try:
+            data = json.loads(src_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        node_cid: dict[str, int] = {}
+        for n in data.get("nodes", []):
+            nid = n.get("id")
+            cid = n.get("community")
+            if nid is not None and cid is not None:
+                node_cid[str(nid)] = int(cid)
+        repo_node_cid[repo] = node_cid
+
+        labels_path = src_path.parent / ".graphify_labels.json"
+        if labels_path.exists():
+            try:
+                raw = json.loads(labels_path.read_text(encoding="utf-8"))
+                repo_cid_label[repo] = {int(k): str(v) for k, v in raw.items()}
+            except Exception:
+                repo_cid_label[repo] = {}
+        else:
+            repo_cid_label[repo] = {}
+
+    from collections import Counter
+
+    labels: dict[int, str] = {}
+    for gcid, members in communities.items():
+        votes: Counter = Counter()
+        for node in members:
+            attrs = G.nodes[node] if node in G.nodes else {}
+            repo = attrs.get("repo")
+            local_id = attrs.get("local_id")
+            if not repo or local_id is None:
+                continue
+            local_cid = repo_node_cid.get(repo, {}).get(str(local_id))
+            if local_cid is None:
+                continue
+            name = repo_cid_label.get(repo, {}).get(local_cid)
+            # Skip un-named fallbacks so they don't out-vote real labels.
+            if not name or name.startswith("Community "):
+                continue
+            votes[name] += 1
+        if votes:
+            # Counter.most_common() is stable on ties (insertion order), which is
+            # deterministic given the manifest is JSON-ordered.
+            labels[gcid] = votes.most_common(1)[0][0]
+        else:
+            labels[gcid] = f"Community {gcid}"
+    return labels
+
+
 def graph_diff(G_old: nx.Graph, G_new: nx.Graph) -> dict:
     """Compare two graph snapshots and return what changed.
 
