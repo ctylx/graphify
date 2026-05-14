@@ -2653,14 +2653,49 @@ def main() -> None:
         except Exception:
             surprises = []
 
-        labels: dict[int, str] = {cid: f"Community {cid}" for cid in communities}
         labels_path = graphify_out / ".graphify_labels.json"
+
+        # Load existing labels from a prior run so we can reuse them.
+        existing: dict[int, str] = {}
+        if labels_path.exists():
+            try:
+                existing = {
+                    int(k): v
+                    for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()
+                }
+            except Exception:
+                pass
+
+        # Start with defaults, then overlay any previously-saved labels that
+        # still match a current community id.
+        labels: dict[int, str] = {cid: f"Community {cid}" for cid in communities}
+        labels.update({cid: name for cid, name in existing.items() if cid in communities})
+
         if label_communities_flag:
             from graphify.analyze import label_communities as _label_communities
-            print(
-                f"[graphify extract] naming {len(communities)} communities via {backend}..."
-            )
-            labels = _label_communities(G, communities, backend=backend)
+
+            # Only label communities that don't already have a meaningful name.
+            # This makes --label-communities safe for daily incremental runs:
+            # new communities get LLM-named, existing ones are untouched.
+            new_cids = [
+                cid for cid in communities
+                if cid not in existing or existing[cid] == f"Community {cid}"
+            ]
+
+            if new_cids:
+                new_communities = {cid: communities[cid] for cid in new_cids}
+                print(
+                    f"[graphify extract] labeling {len(new_cids)} new communities "
+                    f"via {backend} (of {len(communities)} total)..."
+                )
+                new_labels = _label_communities(G, new_communities, backend=backend)
+                labels.update(new_labels)
+            else:
+                print(
+                    f"[graphify extract] all {len(communities)} communities already "
+                    f"named — skipping LLM labeling."
+                )
+
             labels_path.write_text(
                 json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -2668,23 +2703,8 @@ def main() -> None:
             named = sum(1 for v in labels.values() if not v.startswith("Community "))
             print(
                 f"[graphify extract] wrote {labels_path} "
-                f"({named}/{len(labels)} LLM-named)"
+                f"({named}/{len(labels)} named)"
             )
-        elif labels_path.exists():
-            # Reuse existing labels (e.g. from a prior `--label-communities` run or
-            # the skill workflow) so re-running plain `graphify extract` doesn't
-            # downgrade community names back to "Community N" in the report/html.
-            try:
-                labels = {
-                    int(k): v
-                    for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()
-                    if int(k) in communities
-                }
-                # Fill in any new community ids not present in the old file.
-                for cid in communities:
-                    labels.setdefault(cid, f"Community {cid}")
-            except Exception:
-                labels = {cid: f"Community {cid}" for cid in communities}
 
         _to_json(G, communities, str(graph_json_path), force=True)
         if global_merge:
