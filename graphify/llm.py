@@ -482,12 +482,16 @@ def _call_minimax_anthropic(api_key: str, model: str, user_message: str, max_tok
         base_url="https://api.minimaxi.com/anthropic",
         timeout=timeout_s,
     )
+    # MiniMax-M2.x is a reasoning model — disable thinking so the response
+    # contains a `text` block instead of only a `thinking` block (otherwise
+    # small max_tokens budgets get entirely consumed by hidden reasoning).
     resp = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=_EXTRACTION_SYSTEM,
         messages=[{"role": "user", "content": user_message}],
         temperature=1.0,
+        extra_body={"thinking": {"type": "disabled"}},
     )
     raw_content = None
     if resp.content:
@@ -929,12 +933,24 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
         )
     mdl = _default_model_for_backend(backend)
 
+    # Honour GRAPHIFY_API_TIMEOUT (seconds) for explicit override; default to
+    # 600s. Matching the pattern in _call_minimax_anthropic and _call_openai_compat.
+    timeout_raw = os.environ.get("GRAPHIFY_API_TIMEOUT", "").strip()
+    timeout_s: float = 600.0
+    if timeout_raw:
+        try:
+            v = float(timeout_raw)
+            if v > 0:
+                timeout_s = v
+        except ValueError:
+            pass
+
     if backend == "claude":
         try:
             import anthropic
         except ImportError as exc:
             raise ImportError("anthropic package required for claude backend") from exc
-        client = anthropic.Anthropic(api_key=key)
+        client = anthropic.Anthropic(api_key=key, timeout=timeout_s)
         resp = client.messages.create(
             model=mdl,
             max_tokens=max_tokens,
@@ -963,12 +979,13 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
             import anthropic
         except ImportError as exc:
             raise ImportError("anthropic package required for minimax backend") from exc
-        client = anthropic.Anthropic(api_key=key, base_url="https://api.minimaxi.com/anthropic")
+        client = anthropic.Anthropic(api_key=key, base_url="https://api.minimaxi.com/anthropic", timeout=timeout_s)
         resp = client.messages.create(
             model=mdl,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
             temperature=1.0,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         raw_content = None
         if resp.content:
@@ -983,7 +1000,7 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
         from openai import OpenAI
     except ImportError as exc:
         raise ImportError("openai package required for this backend") from exc
-    client = OpenAI(api_key=key, base_url=cfg["base_url"])
+    client = OpenAI(api_key=key, base_url=cfg["base_url"], timeout=timeout_s)
     kwargs: dict = {
         "model": mdl,
         "messages": [{"role": "user", "content": prompt}],

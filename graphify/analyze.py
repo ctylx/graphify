@@ -497,12 +497,20 @@ def label_communities(
     *,
     backend: str,
     max_label_nodes: int = 20,
-    max_tokens: int = 24,
+    max_tokens: int = 4096,
 ) -> dict[int, str]:
     """LLM-name each community using its most central node labels.
 
     Returns {cid: name}. Falls back to "Community {cid}" on empty/error
     so downstream consumers always get a usable label.
+
+    The default max_tokens budget is generous because reasoning backends
+    (e.g. Kimi-k2.6, GLM-5) emit hidden thinking blocks before the final
+    text answer; a small cap (e.g. 24) gets entirely consumed by thinking
+    and the call returns an empty text block. MiniMax is excluded from
+    this list because ``_call_llm`` explicitly disables thinking for it.
+    Models bill on actual output, not the cap, so a high ceiling is free
+    for non-reasoning backends and unblocks reasoning ones.
     """
     try:
         from graphify.llm import _call_llm
@@ -548,6 +556,13 @@ def label_communities(
             if name.lower().startswith(prefix):
                 name = name[len(prefix):].strip()
         if not name:
+            # Surface this — silent fallback used to mask reasoning-model
+            # budget overruns (whole batch came back "Community N").
+            print(
+                f"[graphify] --label-communities: community {cid} returned "
+                "empty text (API returned no content); using default label.",
+                flush=True,
+            )
             labels[cid] = f"Community {cid}"
         else:
             # Cap length defensively in case the model ignores the word budget.
